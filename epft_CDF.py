@@ -13,7 +13,6 @@ import astropy.units as u
 
 # ============================================================
 # 1) SKY TESSELLATION FUNCTION
-#    (same logic as your colleague's function)
 # ============================================================
 
 def sky_cells_m1583(niters, step_size=3 * u.deg, lat_range=(0 * u.deg, 90 * u.deg), test=0):
@@ -111,7 +110,7 @@ def sky_cells_m1583(niters, step_size=3 * u.deg, lat_range=(0 * u.deg, 90 * u.de
 
 
 # ============================================================
-# 2) HELPER FUNCTIONS
+# 2) tesselation/beam correction etc.
 # ============================================================
 
 def assign_cells_from_grid(df, grid_info):
@@ -464,7 +463,7 @@ if df.empty:
 
 
 # ============================================================
-# 6) BUILD THE SKY GRID USING THE SAME FUNCTION AS YOUR COLLEAGUE
+# 6) BUILD THE SKY GRID
 # ============================================================
 
 _, _, grid_info = sky_cells_m1583(
