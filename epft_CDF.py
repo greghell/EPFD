@@ -1,55 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from astropy import units as u
-from mwa_pb import primary_beam
 from astropy.coordinates import EarthLocation, AltAz, get_sun
 from astropy.time import Time
 import astropy.units as u
+from mwa_pb import primary_beam
 
-# ============================================================
-# 1) SKY TESSELLATION FUNCTION
-# ============================================================
+C = 299792458.0
+
+CATALOG_CSV = r"C:\Users\gregh\Desktop\EPFD\identifications_test_v5_starlink_3_min_final_export.csv" # Grigg et al. detection dataset
+COORDS_CSV  = r"C:\Users\gregh\Desktop\EPFD\coords_xy.csv"  # EDA2 antennas coordinates
+
+POL_MODE = "XX"      # "XX" or "YY"
+FREQ_HZ = 150.0e6
+
+# ensures the detections all fall in the 150.05-153 MHz RAS protected band
+FREQ_MIN_HZ = 145.05e6
+FREQ_MAX_HZ = 154.00e6
+
+# all time samples
+TIME_MIN = 1720923916
+TIME_MAX = 1721617384
+
+STACKED_CHANNEL = 31            # full 0.9 MHz channels
+MIN_ELEVATION_DEG = 20.0        # discard detections below 20 degrees in elevation
+
+SNAPSHOT_SECONDS = 2            # integration of each frame in the data set
+WINDOW_SAMPLES = 1000           # 1000 snapshots × 2 s = 2000 s
+OVERLAP_PERCENT = 0.0           # overlap in % between windows - 0% = no overlap
+
+CELL_STEP_SIZE = 3 * u.deg
+RA769_THRESHOLD_DB_W_M2_HZ = -259.0
+
+N_ANT = 256
+
+# Choose gain convention:
+# "N"  -> kernel = N * normalized_synthesis * primary_gain
+# "N2" -> kernel = N^2 * normalized_synthesis * primary_gain --> NOT APPLICABLE
+ARRAY_GAIN_MODE = "N"
+
+DAY_NIGHT_MODE = "night"         # "any", "day", "night"
+
+BEAM_DELAYS = np.zeros(16, dtype=int)
+BEAM_AMPS = np.zeros(16, dtype=int)
+BEAM_AMPS[0] = 1
+
 
 def sky_cells_m1583(niters, step_size=3 * u.deg, lat_range=(0 * u.deg, 90 * u.deg), test=0):
-    """
-    Tessellate the visible sky following the logic used in ITU-R M.1583.
-
-    Parameters
-    ----------
-    niters : int
-        Number of random pointings per cell. In this script we only need
-        the grid definition, so niters can simply be set to 1.
-    step_size : astropy quantity
-        Approximate cell size in degrees.
-    lat_range : tuple
-        Elevation range to tessellate, in degrees.
-    test : int
-        If non-zero, make diagnostic plots.
-
-    Returns
-    -------
-    tel_az, tel_el : arrays
-        Random pointings inside each cell. Not used directly here.
-    grid_info : structured array
-        Cell definitions, containing:
-            cell_lon       = center azimuth
-            cell_lat       = center elevation
-            cell_lon_low   = lower azimuth edge
-            cell_lon_high  = upper azimuth edge
-            cell_lat_low   = lower elevation edge
-            cell_lat_high  = upper elevation edge
-            solid_angle    = approximate cell solid angle proxy
-    """
 
     def sample(niters, low_lon, high_lon, low_lat, high_lat):
-        z_low  = np.cos(np.radians(90 - low_lat))
+        z_low = np.cos(np.radians(90 - low_lat))
         z_high = np.cos(np.radians(90 - high_lat))
-
         az = np.random.uniform(low_lon, high_lon, size=niters)
         el = 90 - np.degrees(np.arccos(np.random.uniform(z_low, z_high, size=niters)))
         return az, el
@@ -59,14 +64,14 @@ def sky_cells_m1583(niters, step_size=3 * u.deg, lat_range=(0 * u.deg, 90 * u.de
     lat_range = (lat_range[0].to_value(u.deg), lat_range[1].to_value(u.deg))
     ncells_lat = int((lat_range[1] - lat_range[0]) / step_size.to_value(u.deg) + 0.5)
 
-    edge_lats = np.linspace(lat_range[0], lat_range[1], ncells_lat + 1, endpoint=True)
+    edge_lats = np.linspace(lat_range[0], lat_range[1], ncells_lat + 1)
     mid_lats = 0.5 * (edge_lats[1:] + edge_lats[:-1])
 
     for low_lat, mid_lat, high_lat in zip(edge_lats[:-1], mid_lats, edge_lats[1:]):
         ncells_lon = int(360 * np.cos(np.radians(mid_lat)) / step_size.to_value(u.deg) + 0.5)
         ncells_lon = max(ncells_lon, 1)
 
-        edge_lons = np.linspace(0, 360, ncells_lon + 1, endpoint=True)
+        edge_lons = np.linspace(0, 360, ncells_lon + 1)
         mid_lons = 0.5 * (edge_lons[1:] + edge_lons[:-1])
 
         solid_angle = (edge_lons[1] - edge_lons[0]) * (
@@ -78,9 +83,9 @@ def sky_cells_m1583(niters, step_size=3 * u.deg, lat_range=(0 * u.deg, 90 * u.de
             cell_mids.append((mid_lon, mid_lat))
             solid_angles.append(solid_angle)
 
-            cell_tel_az, cell_tel_el = sample(niters, low_lon, high_lon, low_lat, high_lat)
-            tel_az.append(cell_tel_az)
-            tel_el.append(cell_tel_el)
+            a, e = sample(niters, low_lon, high_lon, low_lat, high_lat)
+            tel_az.append(a)
+            tel_el.append(e)
 
     tel_az = np.array(tel_az).T
     tel_el = np.array(tel_el).T
@@ -96,50 +101,19 @@ def sky_cells_m1583(niters, step_size=3 * u.deg, lat_range=(0 * u.deg, 90 * u.de
         ("solid_angle", float),
     ])
 
-    if test:
-        plt.figure(figsize=(10, 6))
-        plt.plot(tel_az[0], tel_el[0], "b.")
-        plt.xlabel("Azimuth (deg)")
-        plt.ylabel("Elevation (deg)")
-        plt.grid(True)
-        plt.title("Random pointings inside M.1583 sky cells")
-        plt.tight_layout()
-        plt.show()
-
     return tel_az, tel_el, grid_info
 
 
-# ============================================================
-# 2) tesselation/beam correction etc.
-# ============================================================
-
 def assign_cells_from_grid(df, grid_info):
-    """
-    Assign each detection to a sky cell using the az/el boundaries from grid_info.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Must contain columns 'az' and 'el' in degrees.
-    grid_info : structured array
-        Output from sky_cells_m1583().
-
-    Returns
-    -------
-    df : pandas.DataFrame
-        Copy of input with an extra integer column 'cell_id'.
-        Rows outside the defined grid get cell_id = -1.
-    """
     cell_id = np.full(len(df), -1, dtype=int)
-
     az = df["az"].to_numpy()
     el = df["el"].to_numpy()
 
     for i, cell in enumerate(grid_info):
         mask = (
-            (az >= cell["cell_lon_low"])  &
+            (az >= cell["cell_lon_low"]) &
             (az <  cell["cell_lon_high"]) &
-            (el >= cell["cell_lat_low"])  &
+            (el >= cell["cell_lat_low"]) &
             (el <  cell["cell_lat_high"])
         )
         cell_id[mask] = i
@@ -149,36 +123,83 @@ def assign_cells_from_grid(df, grid_info):
     return out
 
 
-def mwa_analytic_beam_ratio(az_deg, el_deg, freq_hz, pol, delays=None, amps=None, beam_floor=1e-6):
+def load_array_coordinates(csv_path):
+    df = pd.read_csv(csv_path)
+    x = df["x_centered"].to_numpy(dtype=float)
+    y = df["y_centered"].to_numpy(dtype=float)
+    z = np.zeros_like(x)
+    return np.column_stack([x, y, z])
+
+
+def azel_to_unit_vector(az_deg, el_deg):
+    az = np.radians(az_deg)
+    el = np.radians(el_deg)
+
+    east = np.cos(el) * np.sin(az)
+    north = np.cos(el) * np.cos(az)
+    up = np.sin(el)
+
+    return np.stack([east, north, up], axis=-1)
+
+
+def array_factor_for_pointing(
+    xyz_m,
+    freq_hz,
+    point_az_deg,
+    point_el_deg,
+    sample_az_deg,
+    sample_el_deg,
+    weights=None,
+):
     """
-    Compute the normalized analytic beam response at (az, el), divided by the
-    zenith response, for the requested polarization.
-
-    This follows your colleague's recommendation:
-      correction_factor = beam(az, el) / beam(zenith)
-
-    Parameters
-    ----------
-    az_deg, el_deg : float
-        Azimuth and elevation in degrees.
-    freq_hz : float
-        Frequency in Hz.
-    pol : int
-        0 -> XX
-        1 -> YY
-    delays : array-like or None
-        Beamformer delays. Default is all zeros.
-    amps : array-like or None
-        Dipole amplitudes. Default is one active dipole, matching your
-        colleague's example.
-    beam_floor : float
-        Minimum allowed ratio to avoid division by extremely small numbers.
-
-    Returns
-    -------
-    ratio : float
-        Beam power ratio relative to zenith, for the requested polarization.
+    Normalized synthesis beam power pattern.
+    Peak is approximately 1 at the pointing direction.
+    Absolute array gain is applied later through ARRAY_GAIN_MODE.
     """
+    xyz_m = np.asarray(xyz_m, dtype=float)
+    n_elem = xyz_m.shape[0]
+
+    if weights is None:
+        weights = np.ones(n_elem, dtype=complex)
+    else:
+        weights = np.asarray(weights, dtype=complex)
+        if len(weights) != n_elem:
+            raise ValueError("weights must have same length as number of elements")
+
+    sample_az_deg = np.asarray(sample_az_deg, dtype=float).reshape(-1)
+    sample_el_deg = np.asarray(sample_el_deg, dtype=float).reshape(-1)
+
+    lam = C / freq_hz
+    k = 2.0 * np.pi / lam
+
+    s0 = np.asarray(
+        azel_to_unit_vector(point_az_deg, point_el_deg),
+        dtype=float
+    ).reshape(3)
+
+    s = np.asarray(
+        azel_to_unit_vector(sample_az_deg, sample_el_deg),
+        dtype=float
+    ).reshape(-1, 3)
+
+    ds = s - s0
+    phase = k * (ds @ xyz_m.T)  # shape: n_dir × n_ant
+
+    field = np.sum(weights[None, :] * np.exp(1j * phase), axis=1)
+    field_ref = np.sum(weights)
+
+    power = np.abs(field / field_ref) ** 2
+    return np.asarray(power, dtype=float).reshape(-1)
+
+
+def mwa_primary_beam_power_analytic(
+    az_deg,
+    el_deg,
+    freq_hz=150e6,
+    pol="XX",
+    delays=None,
+    amps=None,
+):
     if delays is None:
         delays = np.zeros(16, dtype=int)
 
@@ -189,7 +210,6 @@ def mwa_analytic_beam_ratio(az_deg, el_deg, freq_hz, pol, delays=None, amps=None
     za_rad = np.radians(90.0 - el_deg)
     az_rad = np.radians(az_deg)
 
-    # Beam at direction of interest
     beam_dir = primary_beam.MWA_Tile_analytic(
         za=za_rad,
         az=az_rad,
@@ -198,107 +218,362 @@ def mwa_analytic_beam_ratio(az_deg, el_deg, freq_hz, pol, delays=None, amps=None
         amps=amps,
         zenithnorm=False,
         power=True,
-        jones=False
+        jones=False,
     )
 
-    # Beam at zenith
-    beam_zen = primary_beam.MWA_Tile_analytic(
-        za=0.0,
-        az=0.0,
+    beam_dir = np.asarray(beam_dir).squeeze()
+
+    if beam_dir.size == 1:
+        return float(beam_dir)
+
+    if pol.upper() == "XX":
+        return float(beam_dir[0])
+    elif pol.upper() == "YY":
+        return float(beam_dir[1])
+    else:
+        raise ValueError("pol must be 'XX' or 'YY'")
+
+
+PRIMARY_GAIN_METHOD = "tessellation"    # "tessellation" (same as EPFD analysis) or "grid_proxy" (regular grid in Az/El)
+GRID_PROXY_WEIGHTED = False             # False = pixel count proxy
+                                        # True  = sin(ZA)-weighted integral
+DIPOLE_INDEX = 6                        # arbitrary, 0-255
+
+
+def compute_primary_beam_raw_on_tessellation(
+    grid_info,
+    freq_hz=150e6,
+    pol="XX",
+    delays=None,
+    amps=None,
+    primary_floor=1e-30,
+):
+    """
+    Evaluate raw MWA analytic primary beam on the tessellation cell centers.
+    """
+    if delays is None:
+        delays = np.zeros(16, dtype=int)
+
+    if amps is None:
+        amps = np.zeros(16, dtype=int)
+        amps[DIPOLE_INDEX] = 1
+
+    cell_az = np.asarray(grid_info["cell_lon"], dtype=float).reshape(-1)
+    cell_el = np.asarray(grid_info["cell_lat"], dtype=float).reshape(-1)
+
+    primary_raw = np.array([
+        mwa_primary_beam_power_analytic(
+            az_deg=a,
+            el_deg=e,
+            freq_hz=freq_hz,
+            pol=pol,
+            delays=delays,
+            amps=amps,
+        )
+        for a, e in zip(cell_az, cell_el)
+    ], dtype=float)
+
+    primary_raw = np.maximum(primary_raw, primary_floor)
+
+    return cell_az, cell_el, primary_raw
+
+
+def compute_primary_gain_tessellation(
+    grid_info,
+    freq_hz=150e6,
+    pol="XX",
+    delays=None,
+    amps=None,
+    primary_floor=1e-30,
+):
+    """
+    Convert raw primary beam to dBi using the M.1583 sky-cell solid-angle integral.
+    G(az,el) = 4*pi*B(az,el) / integral_visible[B dOmega] (approx. 0 dBi)
+    """
+    cell_az, cell_el, primary_raw = compute_primary_beam_raw_on_tessellation(
+        grid_info=grid_info,
+        freq_hz=freq_hz,
+        pol=pol,
+        delays=delays,
+        amps=amps,
+        primary_floor=primary_floor,
+    )
+
+    az_low  = np.radians(np.asarray(grid_info["cell_lon_low"], dtype=float).reshape(-1))
+    az_high = np.radians(np.asarray(grid_info["cell_lon_high"], dtype=float).reshape(-1))
+    el_low  = np.radians(np.asarray(grid_info["cell_lat_low"], dtype=float).reshape(-1))
+    el_high = np.radians(np.asarray(grid_info["cell_lat_high"], dtype=float).reshape(-1))
+
+    # Exact solid angle of az/el cell:
+    # dOmega = dAz * d(sin El)
+    solid_angle_sr = (az_high - az_low) * (np.sin(el_high) - np.sin(el_low))
+
+    beam_integral = np.sum(primary_raw * solid_angle_sr)
+
+    primary_gain_linear = 4.0 * np.pi * primary_raw / beam_integral
+    primary_gain_dbi = 10.0 * np.log10(primary_gain_linear)
+
+    return pd.DataFrame({
+        "cell_id": np.arange(len(cell_az)),
+        "az_deg": cell_az,
+        "el_deg": cell_el,
+        "solid_angle_sr": solid_angle_sr,
+        "primary_raw": primary_raw,
+        "primary_gain_linear": primary_gain_linear,
+        "primary_gain_dbi": primary_gain_dbi,
+        "method": "tessellation",
+        "beam_integral": beam_integral,
+    })
+
+
+def estimate_primary_gain_grid_proxy(
+    freq_hz=150e6,
+    pol="XX",
+    delays=None,
+    amps=None,
+    dipole_index=6,
+    weighted=False,
+    n_za=91,
+    n_az=361,
+):
+    """
+    Evaluate MWA analytic primary beam on regular grid in Az/El
+    If weighted=False:
+        uses pixel-count proxy:
+            gain = peak * (2*Npix) / sum(beam)
+    If weighted=True:
+        uses proper sin(ZA) solid-angle weighting:
+            gain = 4*pi*peak / integral_visible[B dOmega]
+    """
+    if delays is None:
+        delays = np.zeros(16, dtype=int)
+
+    if amps is None:
+        amps = np.zeros(16, dtype=int)
+        amps[dipole_index] = 1
+
+    za = np.linspace(0.0, np.pi / 2.0, n_za)
+    az = np.linspace(0.0, 2.0 * np.pi, n_az, endpoint=False)
+
+    za_grid, az_grid = np.meshgrid(za, az, indexing="ij")
+
+    beam = primary_beam.MWA_Tile_analytic(
+        za=za_grid,
+        az=az_grid,
         freq=freq_hz,
         delays=delays,
         amps=amps,
         zenithnorm=False,
         power=True,
-        jones=False
+        jones=False,
     )
 
-    beam_dir = np.asarray(beam_dir).squeeze()
-    beam_zen = np.asarray(beam_zen).squeeze()
+    beam = np.asarray(beam).squeeze()
 
-    if beam_dir.ndim == 0:
-        ratio = float(beam_dir) / float(beam_zen)
-    elif beam_dir.size == 2:
-        if pol == 0:
-            ratio = float(beam_dir[0]) / float(beam_zen[0])   # XX
-        elif pol == 1:
-            ratio = float(beam_dir[1]) / float(beam_zen[1])   # YY
+    if beam.ndim == 3:
+        if pol.upper() == "XX":
+            b = beam[0]
+        elif pol.upper() == "YY":
+            b = beam[1]
         else:
-            raise ValueError(f"Unknown polarization index: {pol}")
+            raise ValueError("pol must be 'XX' or 'YY'")
     else:
-        raise ValueError(f"Unexpected beam output shape: {beam_dir.shape}")
+        b = beam
 
-    return max(ratio, beam_floor)
+    peak_power = np.nanmax(b)
+
+    if weighted:
+        dza = za[1] - za[0]
+        daz = az[1] - az[0]
+        domega = np.sin(za_grid) * dza * daz
+        beam_integral = np.nansum(b * domega)
+        peak_gain_linear = 4.0 * np.pi * peak_power / beam_integral
+        method = "grid_proxy_weighted"
+    else:
+        total_power_proxy = np.nansum(b)
+        size_proxy = 2.0 * b.size
+        peak_gain_linear = peak_power * size_proxy / total_power_proxy
+        beam_integral = total_power_proxy
+        method = "grid_proxy_unweighted"
+
+    peak_gain_dbi = 10.0 * np.log10(peak_gain_linear)
+
+    return {
+        "method": method,
+        "peak_power_raw": peak_power,
+        "beam_integral_or_sum": beam_integral,
+        "peak_gain_linear": peak_gain_linear,
+        "peak_gain_dbi": peak_gain_dbi,
+    }
 
 
-def compute_beam_corrected_flux(df, beam_floor=1e-6, delays=None, amps=None):
+def compute_primary_gain_grid_proxy_on_tessellation(
+    grid_info,
+    freq_hz=150e6,
+    pol="XX",
+    delays=None,
+    amps=None,
+    primary_floor=1e-30,
+    dipole_index=6,
+    weighted=False,
+    n_za=91,
+    n_az=361,
+):
     """
-    Correct measured flux densities using the analytic beam, normalized by
-    the zenith response.
-
-    Assumption
-    ----------
-    The measured catalog fluxes are apparent fluxes attenuated by the beam.
-    We divide by:
-        beam(az, el) / beam(zenith)
-    to estimate a zenith/0-dBi-referenced quantity.
-
-    Returns
-    -------
-    DataFrame with added columns:
-        beam_ratio
-        flux_jy_0dBi
-        pfd_w_m2_hz_0dBi
-        pfd_db_w_m2_hz_0dBi
+    Peak normalization, then scale the tessellation beam
+    so that its maximum equals the estimated peak gain.
     """
-    beam_ratios = []
+    cell_az, cell_el, primary_raw = compute_primary_beam_raw_on_tessellation(
+        grid_info=grid_info,
+        freq_hz=freq_hz,
+        pol=pol,
+        delays=delays,
+        amps=amps,
+        primary_floor=primary_floor,
+    )
 
-    for az_deg, el_deg, freq_hz, pol in zip(df["az"], df["el"], df["freq_hz"], df["pol"]):
-        r = mwa_analytic_beam_ratio(
-            az_deg=az_deg,
-            el_deg=el_deg,
+    proxy = estimate_primary_gain_grid_proxy(
+        freq_hz=freq_hz,
+        pol=pol,
+        delays=delays,
+        amps=amps,
+        dipole_index=dipole_index,
+        weighted=weighted,
+        n_za=n_za,
+        n_az=n_az,
+    )
+
+    raw_peak = np.nanmax(primary_raw)
+
+    primary_gain_linear = primary_raw / raw_peak * proxy["peak_gain_linear"]
+    primary_gain_dbi = 10.0 * np.log10(primary_gain_linear)
+
+    return pd.DataFrame({
+        "cell_id": np.arange(len(cell_az)),
+        "az_deg": cell_az,
+        "el_deg": cell_el,
+        "primary_raw": primary_raw,
+        "primary_gain_linear": primary_gain_linear,
+        "primary_gain_dbi": primary_gain_dbi,
+        "method": proxy["method"],
+        "proxy_peak_gain_linear": proxy["peak_gain_linear"],
+        "proxy_peak_gain_dbi": proxy["peak_gain_dbi"],
+        "proxy_peak_power_raw": proxy["peak_power_raw"],
+        "proxy_beam_integral_or_sum": proxy["beam_integral_or_sum"],
+    })
+
+
+def compute_primary_gain_on_tessellation(
+    grid_info,
+    freq_hz=150e6,
+    pol="XX",
+    method="tessellation",
+    weighted_grid_proxy=False,
+    delays=None,
+    amps=None,
+    dipole_index=6,
+):
+    """
+    Wrapper allowing comparison between:
+        method="tessellation"  -> solid-angle integral over sky cells
+        method="grid_proxy"    -> grid proxy
+    (test only)
+    """
+    method = method.lower()
+
+    if method == "tessellation":
+        df = compute_primary_gain_tessellation(
+            grid_info=grid_info,
             freq_hz=freq_hz,
             pol=pol,
             delays=delays,
             amps=amps,
-            beam_floor=beam_floor
         )
-        beam_ratios.append(r)
 
-    out = df.copy()
-    out["beam_ratio"] = np.array(beam_ratios)
+    elif method == "grid_proxy":
+        df = compute_primary_gain_grid_proxy_on_tessellation(
+            grid_info=grid_info,
+            freq_hz=freq_hz,
+            pol=pol,
+            delays=delays,
+            amps=amps,
+            dipole_index=dipole_index,
+            weighted=weighted_grid_proxy,
+        )
 
-    # Undo attenuation relative to zenith
-    out["flux_jy_0dBi"] = out["flux_jy"] / out["beam_ratio"]
+    else:
+        raise ValueError("method must be 'tessellation' or 'grid_proxy'")
 
-    # Jy -> W/m^2/Hz
-    out["pfd_w_m2_hz_0dBi"] = out["flux_jy_0dBi"] * 1e-26
-    out["pfd_db_w_m2_hz_0dBi"] = 10 * np.log10(out["pfd_w_m2_hz_0dBi"])
+    print("\nPrimary beam gain normalization")
+    print("--------------------------------")
+    print(f"Method: {df['method'].iloc[0]}")
+    print(f"Max gain: {df['primary_gain_linear'].max():.4f} linear")
+    print(f"Max gain: {df['primary_gain_dbi'].max():.2f} dBi")
+    print(f"Median gain: {df['primary_gain_dbi'].median():.2f} dBi")
+    print(f"Min gain: {df['primary_gain_dbi'].min():.2f} dBi")
 
-    return out
+    return df
+
+
+def get_array_gain_factor(n_ant, mode="N"):
+    if mode.upper() == "N":
+        return float(n_ant)
+    elif mode.upper() == "N2":
+        return float(n_ant ** 2)
+    else:
+        raise ValueError("ARRAY_GAIN_MODE must be 'N' or 'N2'")
+
+
+def compute_convolution_kernel_for_source_cell(
+    source_cell_id,
+    xyz_m,
+    grid_info,
+    primary_gain_linear,
+    freq_hz=150e6,
+    n_ant=256,
+    array_gain_mode="N",
+):
+    """
+    Imaging-array convolution kernel.
+    A source in source_cell_id is redistributed across the image by the
+    normalized synthesis beam. The resulting sky map is modulated by the
+    primary-beam gain in each output sky direction.
+        convolved_map(c) += P(source)
+                            * array_gain_factor
+                            * synthesis_beam(c | source)
+                            * primary_gain(c)
+    """
+
+    cell_az = np.asarray(grid_info["cell_lon"], dtype=float).reshape(-1)
+    cell_el = np.asarray(grid_info["cell_lat"], dtype=float).reshape(-1)
+
+    src_az = cell_az[source_cell_id]
+    src_el = cell_el[source_cell_id]
+
+    synth = array_factor_for_pointing(
+        xyz_m=xyz_m,
+        freq_hz=freq_hz,
+        point_az_deg=src_az,
+        point_el_deg=src_el,
+        sample_az_deg=cell_az,
+        sample_el_deg=cell_el,
+    )
+
+    gain_factor = get_array_gain_factor(n_ant, array_gain_mode)
+
+    kernel = gain_factor * synth * primary_gain_linear
+
+    return kernel
+
 
 def add_mwa_sun_elevation(df, time_col="time"):
     """
-    Add Sun elevation at the MWA site for each Unix timestamp.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Must contain a Unix timestamp column.
-    time_col : str
-        Name of the timestamp column in seconds since Unix epoch.
-
-    Returns
-    -------
-    df : pandas.DataFrame
-        Copy with added columns:
-            sun_el_deg
-            is_day
+    Sun up or down, for daytime/night time comparison only
     """
     mwa_location = EarthLocation(
         lat=-26.7033 * u.deg,
         lon=116.6708 * u.deg,
-        height=377 * u.m
+        height=377 * u.m,
     )
 
     times = Time(df[time_col].to_numpy(), format="unix")
@@ -312,65 +587,193 @@ def add_mwa_sun_elevation(df, time_col="time"):
     return out
 
 
-# ============================================================
-# 3) USER SETTINGS
-# ============================================================
+def plot_epfd_cdf_paper(
+    values_linear,
+    threshold_db=-259.0,
+    output_file="cdf_convolved.pdf",
+    y_min=None,
+):
+    values_linear = np.asarray(values_linear, dtype=float)
+    total_samples = len(values_linear)
 
-CSV_PATH = r"C:\Users\gregh\Desktop\EPFD\identifications_test_v5_starlink_3_min_final_export.csv"
+    nonzero = values_linear[values_linear > 0]
+    frac_zero = 1.0 - len(nonzero) / total_samples
 
-# Select only the stacked image measurements
-STACKED_CHANNEL = 31
+    if len(nonzero) == 0:
+        raise ValueError("No nonzero values to plot.")
 
-# Minimum elevation to include in the analysis
-MIN_ELEVATION_DEG = 20.0
+    values_db = 10.0 * np.log10(nonzero)
+    sorted_vals = np.sort(values_db)
 
-# Polarization mode:
-#   "XX" -> use pol = 0 only
-#   "YY" -> use pol = 1 only
-#   "I"  -> use both and sum them (Stokes I-like total intensity)
-POL_MODE = "XX"
+    cdf_percent = (
+        np.arange(1, len(sorted_vals) + 1) / total_samples
+        + frac_zero
+    ) * 100.0
 
-# Restrict to the radio astronomy band
-FREQ_MIN_HZ = 145.05e6
-FREQ_MAX_HZ = 154.00e6
+    threshold_linear = 10.0 ** (threshold_db / 10.0)
+    frac_exceed = np.mean(values_linear > threshold_linear)
 
-# Optional time restriction
-#TIME_MIN = None   # e.g. 1.72e9
-#TIME_MAX = None   # e.g. 1.722e9
-TIME_MIN = 1.72e9
-TIME_MAX = 1.722e9
+    plt.figure(figsize=(8, 6))
+    plt.plot(sorted_vals, cdf_percent, linewidth=2, label="Empirical CDF")
 
-# Time binning for "instantaneous" samples
-TIME_BIN_SECONDS = 1
+    plt.axvline(
+        threshold_db,
+        linestyle="--",
+        linewidth=2,
+        label=f"RA.769 threshold = {threshold_db:.0f} dB(W/m$^2$/Hz)",
+    )
 
-# Averaging window length
-WINDOW_SECONDS = 2000
+    plt.text(0.02, 0.15, f"{frac_zero*100:.1f}% of samples = 0",
+             transform=plt.gca().transAxes, fontsize=10)
 
-# Number of M.1583-like random cells across the sky
-CELL_STEP_SIZE = 3 * u.deg
+    plt.text(0.02, 0.08, f"Exceedance: {frac_exceed*100:.3f}%",
+             transform=plt.gca().transAxes, fontsize=10)
 
-# RA.769 threshold for 150.05–153 MHz continuum
-RA769_THRESHOLD_DB_W_M2_HZ = -259.0
+    plt.xlabel("EPFD-like value [dB(W/m$^2$/Hz)]")
+    plt.ylabel("Cumulative probability [%]")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
 
-# Beam safeguard
-BEAM_FLOOR = 1e-6
+    plt.xlim([sorted_vals.min() - 10, sorted_vals.max() + 10])
 
-# Day/night mode:
-#   "any"   -> keep all data in the selected time range
-#   "day"   -> keep only samples with Sun above horizon
-#   "night" -> keep only samples with Sun below horizon
-DAY_NIGHT_MODE = "any"
+    if y_min is None:
+        y_min = max(0, np.floor(frac_zero * 100) - 1)
+    plt.ylim([y_min, 100.2])
 
-# Analytic beam setup from colleague's example
-BEAM_DELAYS = np.zeros(16, dtype=int)
-BEAM_AMPS = np.zeros(16, dtype=int)
-BEAM_AMPS[0] = 1
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300)
+    plt.show()
+
+    print(f"Zero fraction: {frac_zero*100:.6f}%")
+    print(f"Exceedance fraction: {frac_exceed*100:.6f}%")
 
 
-# ============================================================
-# 4) LOAD THE CATALOG
-# ============================================================
+def nearest_tessellation_cell(grid_info, az_deg, el_deg):
+    cell_az = np.asarray(grid_info["cell_lon"], dtype=float).reshape(-1)
+    cell_el = np.asarray(grid_info["cell_lat"], dtype=float).reshape(-1)
 
+    s_req = azel_to_unit_vector(az_deg, el_deg)
+    s_cells = azel_to_unit_vector(cell_az, cell_el)
+
+    dot = np.sum(s_cells * s_req, axis=1)
+    dot = np.clip(dot, -1.0, 1.0)
+
+    sep_deg = np.degrees(np.arccos(dot))
+    idx = int(np.argmin(sep_deg))
+
+    return idx, cell_az[idx], cell_el[idx], sep_deg[idx]
+
+
+def plot_primary_synthesis_combined_polar(
+    xyz_m,
+    grid_info,
+    primary_gain_linear,
+    point_az_deg,
+    point_el_deg,
+    freq_hz=150e6,
+    n_ant=256,
+    array_gain_mode="N",
+    floor_db=-80,
+    marker_size=14,
+):
+    nearest_cell, actual_az_deg, actual_el_deg, sep_deg = nearest_tessellation_cell(
+        grid_info, point_az_deg, point_el_deg
+    )
+
+    cell_az = np.asarray(grid_info["cell_lon"], dtype=float).reshape(-1)
+    cell_el = np.asarray(grid_info["cell_lat"], dtype=float).reshape(-1)
+
+    synth = array_factor_for_pointing(
+        xyz_m=xyz_m,
+        freq_hz=freq_hz,
+        point_az_deg=actual_az_deg,
+        point_el_deg=actual_el_deg,
+        sample_az_deg=cell_az,
+        sample_el_deg=cell_el,
+    )
+
+    gain_factor = get_array_gain_factor(n_ant, array_gain_mode)
+
+    # Imaging-map convention:
+    # combined = synthesis response × primary gain at output direction.
+    combined = gain_factor * synth * primary_gain_linear
+
+    panels = [
+        ("Primary gain", primary_gain_linear),
+        ("Normalized synthesis beam", synth),
+        (f"{array_gain_mode}: array gain × synthesis × output primary", combined),
+    ]
+
+    theta = np.radians(cell_az)
+    r = np.radians(90.0 - cell_el)
+
+    fig, axes = plt.subplots(
+        1, 3,
+        figsize=(18, 6),
+        subplot_kw={"projection": "polar"}
+    )
+
+    for ax, panel in zip(axes, panels):
+        title = panel[0]
+        values_linear = np.asarray(panel[1], dtype=float)
+
+        vmax = np.nanmax(values_linear)
+        vmax_db = 10 * np.log10(vmax)
+
+        v_point = values_linear[nearest_cell]
+        v_point_db = 10 * np.log10(v_point) if v_point > 0 else -np.inf
+
+        values_db = 10 * np.log10(
+            np.maximum(values_linear, 10 ** (floor_db / 10.0))
+        )
+
+        sc = ax.scatter(
+            theta,
+            r,
+            c=values_db,
+            s=marker_size,
+            vmin=floor_db,
+            vmax=vmax_db,
+        )
+
+        ax.scatter(
+            np.radians(actual_az_deg),
+            np.radians(90.0 - actual_el_deg),
+            marker="x",
+            s=120,
+            linewidths=2,
+            color="white",
+        )
+
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+        ax.set_ylim(0, np.pi / 2)
+        ax.set_yticklabels([])
+        ax.grid(True, alpha=0.3)
+
+        ax.set_title(
+            f"{title}\n"
+            f"max = {vmax:.3e} ({vmax_db:.1f} dB)\n"
+            f"@point = {v_point:.3e} ({v_point_db:.1f} dB)"
+        )
+
+        cbar = fig.colorbar(sc, ax=ax, pad=0.1, shrink=0.8)
+        cbar.set_label("Power / gain [dB]")
+
+    fig.suptitle(
+        f"Beam components @ {freq_hz/1e6:.1f} MHz\n"
+        f"Requested Az={point_az_deg:.1f}°, El={point_el_deg:.1f}°\n"
+        f"Used cell Az={actual_az_deg:.1f}°, El={actual_el_deg:.1f}° "
+        f"(Δ={sep_deg:.2f}°)",
+        y=0.98,
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    plt.savefig(r"C:\Users\gregh\Desktop\EPFD\beams.pdf", dpi=300)
+    plt.show()
+
+
+# data set structure
 cols = [
     "time", "img_idx", "freq_hz", "norad", "fchan",
     "pol", "flux_jy", "range_km",
@@ -380,441 +783,220 @@ cols = [
     "pix_dist", "x_err", "y_err"
 ]
 
-df = pd.read_csv(
-    CSV_PATH,
-    sep=r"\s+",
-    names=cols,
-    header=None
-)
+df = pd.read_csv(CATALOG_CSV, sep=r"\s+", names=cols, header=None)
 
 print("Raw shape:", df.shape)
 
-
-# ============================================================
-# 5) FILTER THE DATA
-# ============================================================
-
-# Keep only the stacked measurements
 df = df[df["fchan"] == STACKED_CHANNEL].copy()
-
-# Frequency selection
 df = df[(df["freq_hz"] >= FREQ_MIN_HZ) & (df["freq_hz"] <= FREQ_MAX_HZ)].copy()
 
-# Optional time restriction
 if TIME_MIN is not None:
-    df = df[df["time"] >= TIME_MIN]
+    df = df[df["time"] >= TIME_MIN].copy()
 if TIME_MAX is not None:
-    df = df[df["time"] <= TIME_MAX]
+    df = df[df["time"] <= TIME_MAX].copy()
 
-# Add Sun elevation at MWA for the remaining rows
 df = add_mwa_sun_elevation(df, time_col="time")
 
-# Apply optional day/night filter inside the chosen time range
-if DAY_NIGHT_MODE == "any":
-    pass
-elif DAY_NIGHT_MODE == "day":
+if DAY_NIGHT_MODE == "day":
     df = df[df["is_day"]].copy()
 elif DAY_NIGHT_MODE == "night":
     df = df[~df["is_day"]].copy()
-else:
+elif DAY_NIGHT_MODE != "any":
     raise ValueError("DAY_NIGHT_MODE must be 'any', 'day', or 'night'")
 
-# Select polarization mode
 if POL_MODE == "XX":
     df = df[df["pol"] == 0].copy()
     pol_label = "XX"
 elif POL_MODE == "YY":
     df = df[df["pol"] == 1].copy()
     pol_label = "YY"
-elif POL_MODE == "I":
-    # Keep both linear polarizations; they will be summed later
-    df = df[df["pol"].isin([0, 1])].copy()
-    pol_label = "Stokes I (XX+YY)"
 else:
-    raise ValueError("POL_MODE must be 'XX', 'YY', or 'I'")
+    raise ValueError("This convolution script currently expects POL_MODE = 'XX' or 'YY'.")
 
-# Remove bad rows
 df = df[np.isfinite(df["flux_jy"])]
 df = df[df["flux_jy"] > 0]
 df = df[np.isfinite(df["az"]) & np.isfinite(df["el"])]
-
-# Elevation cut
 df = df[df["el"] >= MIN_ELEVATION_DEG].copy()
 
-# Convert time to datetime and also keep integer seconds
-df["time_dt"] = pd.to_datetime(df["time"], unit="s")
-df["time_sec"] = np.floor(df["time"]).astype(int)
+df["time_bin"] = (
+    np.floor(df["time"] / SNAPSHOT_SECONDS).astype(int) * SNAPSHOT_SECONDS
+).astype(int)
+
+# No primary beam correction here
+df["pfd_w_m2_hz"] = df["flux_jy"] * 1e-26
 
 print("Shape after filtering:", df.shape)
+print("Polarization:", pol_label)
 print("Unique frequencies (MHz):", np.sort(df["freq_hz"].unique() / 1e6))
-print(f"Polarization mode: {pol_label}")
-print(f"Minimum elevation: {MIN_ELEVATION_DEG:.1f} deg")
-print("Rows per polarization after filtering:")
-print(df["pol"].value_counts().sort_index())
-
-print(f"Day/night mode: {DAY_NIGHT_MODE}")
-if not df.empty:
-    print(f"Sun elevation range in filtered data: {df['sun_el_deg'].min():.2f} to {df['sun_el_deg'].max():.2f} deg")
-    print("Rows by day/night after filtering:")
-    print(df["is_day"].value_counts())
-
-if df.empty:
-    raise ValueError("No detections remain after filtering.")
 
 
-# ============================================================
-# 6) BUILD THE SKY GRID
-# ============================================================
 
 _, _, grid_info = sky_cells_m1583(
     niters=1,
     step_size=CELL_STEP_SIZE,
     lat_range=(0 * u.deg, 90 * u.deg),
-    test=0
+    test=0,
 )
 
-print("Number of sky cells:", len(grid_info))
+n_cells = len(grid_info)
+all_cells = np.arange(n_cells)
 
-# Assign each detection to a cell
+print("Number of sky cells:", n_cells)
+
 df = assign_cells_from_grid(df, grid_info)
-
-# Remove any detections that somehow fall outside the grid
 df = df[df["cell_id"] >= 0].copy()
 
 print("Shape after cell assignment:", df.shape)
 
 
-# ============================================================
-# 7) PRIMARY-BEAM CORRECTION TO REFERENCE TO 0 dBi
-# ============================================================
+xyz_m = load_array_coordinates(COORDS_CSV)
+print(f"Loaded {len(xyz_m)} array elements")
 
-df = compute_beam_corrected_flux(
-    df,
-    beam_floor=BEAM_FLOOR,
+primary_df = compute_primary_gain_on_tessellation(
+    grid_info=grid_info,
+    freq_hz=FREQ_HZ,
+    pol=POL_MODE,
+    method=PRIMARY_GAIN_METHOD,
+    weighted_grid_proxy=GRID_PROXY_WEIGHTED,
     delays=BEAM_DELAYS,
-    amps=BEAM_AMPS
+    amps=BEAM_AMPS,
+    dipole_index=DIPOLE_INDEX,
 )
 
-print("Beam ratio statistics (relative to zenith):")
-print(df["beam_ratio"].describe())
+primary_gain_linear = primary_df["primary_gain_linear"].to_numpy()
+
+print(primary_df["primary_gain_dbi"].describe())
 
 
-# ============================================================
-# 8) INSTANTANEOUS EPFD-LIKE SAMPLES PER (TIME, CELL)
-# ============================================================
-
-# For each second and each sky cell, sum the 0 dBi-referenced pfd
-# contributions of all detections in that cell.
 inst = (
-    df.groupby(["time_sec", "cell_id"])["pfd_w_m2_hz_0dBi"]
+    df.groupby(["time_bin", "cell_id"])["pfd_w_m2_hz"]
       .sum()
       .reset_index()
 )
 
-inst["epfd_db_w_m2_hz_0dBi"] = 10 * np.log10(inst["pfd_w_m2_hz_0dBi"])
-
-print("Number of instantaneous (time,cell) samples:", len(inst))
+print("Number of instantaneous nonzero (time,cell) samples:", len(inst))
 
 
-# ============================================================
-# 9) ASSIGN EACH INSTANTANEOUS SAMPLE TO A 2000-s WINDOW
-# ============================================================
+if OVERLAP_PERCENT < 0 or OVERLAP_PERCENT >= 100:
+    raise ValueError("OVERLAP_PERCENT must be >= 0 and < 100.")
 
-inst["window"] = (inst["time_sec"] // WINDOW_SECONDS).astype(int)
+step_samples = int(round(WINDOW_SAMPLES * (1.0 - OVERLAP_PERCENT / 100.0)))
+step_samples = max(step_samples, 1)
 
-# Sum detected contributions within each (window, cell)
-window_cell_sum = (
-    inst.groupby(["window", "cell_id"])["pfd_w_m2_hz_0dBi"]
-        .sum()
-        .reset_index()
+window_duration_sec = WINDOW_SAMPLES * SNAPSHOT_SECONDS
+step_seconds = step_samples * SNAPSHOT_SECONDS
+
+print(f"Window length: {WINDOW_SAMPLES} samples = {window_duration_sec} s")
+print(f"Overlap: {OVERLAP_PERCENT:.1f}%")
+print(f"Window step: {step_samples} samples = {step_seconds} s")
+
+t_min = int(np.floor(df["time_bin"].min() / SNAPSHOT_SECONDS) * SNAPSHOT_SECONDS)
+t_max = int(np.ceil(df["time_bin"].max() / SNAPSHOT_SECONDS) * SNAPSHOT_SECONDS)
+
+window_starts = np.arange(
+    t_min,
+    t_max - window_duration_sec + SNAPSHOT_SECONDS,
+    step_seconds,
+    dtype=int,
 )
 
-# Convert summed power in the window to a time average over the full 2000 s
-window_cell_sum["pfd_w_m2_hz_0dBi_avg"] = (
-    window_cell_sum["pfd_w_m2_hz_0dBi"] / WINDOW_SECONDS
+print("Number of candidate windows:", len(window_starts))
+
+
+kernel_cache = {}
+convolved_windows = []
+
+for iw, t0 in enumerate(window_starts):
+    t1 = t0 + window_duration_sec
+
+    inst_w = inst[(inst["time_bin"] >= t0) & (inst["time_bin"] < t1)]
+
+    if inst_w.empty:
+        continue
+
+    source_avg = (
+        inst_w.groupby("cell_id")["pfd_w_m2_hz"]
+              .sum()
+              .reindex(all_cells)
+              .fillna(0.0)
+              .to_numpy()
+              / WINDOW_SAMPLES
+    )
+
+    nonzero_source_cells = np.where(source_avg > 0)[0]
+    convolved_map = np.zeros(n_cells, dtype=float)
+
+    for src_cell in nonzero_source_cells:
+        if src_cell not in kernel_cache:
+            kernel_cache[src_cell] = compute_convolution_kernel_for_source_cell(
+                source_cell_id=src_cell,
+                xyz_m=xyz_m,
+                grid_info=grid_info,
+                primary_gain_linear=primary_gain_linear,
+                freq_hz=FREQ_HZ,
+                n_ant=N_ANT,
+                array_gain_mode=ARRAY_GAIN_MODE,
+            )
+
+        convolved_map += source_avg[src_cell] * kernel_cache[src_cell]
+
+    out = pd.DataFrame({
+        "window_index": iw,
+        "window_start": t0,
+        "window_stop": t1,
+        "cell_id": all_cells,
+        "pfd_w_m2_hz_conv": convolved_map,
+    })
+
+    convolved_windows.append(out)
+
+    if (len(convolved_windows) % 10) == 0:
+        print(f"Processed {len(convolved_windows)} active windows...")
+
+if len(convolved_windows) == 0:
+    raise ValueError("No active windows found.")
+
+epfd_conv = pd.concat(convolved_windows, ignore_index=True)
+
+epfd_conv["epfd_db_w_m2_hz_conv"] = np.where(
+    epfd_conv["pfd_w_m2_hz_conv"] > 0,
+    10.0 * np.log10(epfd_conv["pfd_w_m2_hz_conv"]),
+    np.nan,
 )
 
-# ============================================================
-# 10) EXPAND ONLY TO WINDOW × CELL (NOT TIME × CELL)
-# ============================================================
+linear_values = epfd_conv["pfd_w_m2_hz_conv"].to_numpy()
 
-# Keep only windows that actually contain at least one detected contribution
-all_windows = np.sort(window_cell_sum["window"].unique())
-all_cells = np.arange(len(grid_info))
-print(f"Number of active windows kept: {len(all_windows)}")
-print(f"Window IDs kept: {all_windows[:10]}{' ...' if len(all_windows) > 10 else ''}")
+print("Number of active windows processed:", epfd_conv["window_index"].nunique())
+print("Total window×cell samples:", len(linear_values))
+print("Nonzero window×cell samples:", np.sum(linear_values > 0))
+print("Fraction nonzero:", 100 * np.mean(linear_values > 0), "%")
 
-full_window_index = pd.MultiIndex.from_product(
-    [all_windows, all_cells],
-    names=["window", "cell_id"]
-)
-
-epfd_window = (
-    window_cell_sum.set_index(["window", "cell_id"])
-                  .reindex(full_window_index)
-                  .reset_index()
-)
-
-# Cells with no detections in a window are assigned zero contribution
-epfd_window["pfd_w_m2_hz_0dBi_avg"] = epfd_window["pfd_w_m2_hz_0dBi_avg"].fillna(0.0)
-
-# Convert to dB only for nonzero values
-epfd_window["epfd_db_w_m2_hz_0dBi"] = np.where(
-    epfd_window["pfd_w_m2_hz_0dBi_avg"] > 0,
-    10 * np.log10(epfd_window["pfd_w_m2_hz_0dBi_avg"]),
-    np.nan
-)
-
-n_total = len(epfd_window)
-n_nonzero = np.sum(epfd_window["pfd_w_m2_hz_0dBi_avg"] > 0)
-
-print(f"Total active window×cell samples: {n_total}")
-print(f"Nonzero active window×cell samples: {n_nonzero}")
-print(f"Fraction nonzero: {100*n_nonzero/n_total:.6f} %")
-
-# Keep linear values for threshold comparison
-linear_values = epfd_window["pfd_w_m2_hz_0dBi_avg"].to_numpy()
-
-# Keep dB values for plotting
-values_db = epfd_window["epfd_db_w_m2_hz_0dBi"].dropna().to_numpy()
-
-print("Number of averaged window×cell samples:", len(linear_values))
-print("Number of nonzero samples for plotting:", len(values_db))
-
-# ============================================================
-# 11) THRESHOLD COMPARISON
-# ============================================================
-
-threshold_linear = 10 ** (RA769_THRESHOLD_DB_W_M2_HZ / 10.0)
-
+threshold_linear = 10.0 ** (RA769_THRESHOLD_DB_W_M2_HZ / 10.0)
 exceedance = np.mean(linear_values > threshold_linear)
 
 print(f"RA.769 threshold: {RA769_THRESHOLD_DB_W_M2_HZ:.1f} dB(W/m^2/Hz)")
-print(f"Fraction above threshold: {100 * exceedance:.6f} %")
+print(f"Fraction above threshold: {100 * exceedance:.6f}%")
 
-# ============================================================
-# 12) CDF
-# ============================================================
 
-sorted_vals = np.sort(values_db)
-cdf = np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)
-
-# Histogram
-plt.figure(figsize=(10, 6))
-counts, bins = np.histogram(values_db, bins=100)
-counts_percent = counts / counts.sum() * 100
-
-plt.bar(
-    bins[:-1],
-    counts_percent,
-    width=np.diff(bins),
-    align="edge",
-    alpha=0.6,
-    label="Nonzero EPFD samples"
+np.savez(fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}.npz",
+         linear_values=linear_values,
+         RA769_THRESHOLD_DB_W_M2_HZ=RA769_THRESHOLD_DB_W_M2_HZ,
 )
 
-plt.axvline(
-    RA769_THRESHOLD_DB_W_M2_HZ,
-    linestyle="--",
-    linewidth=2,
-    label=f"RA.769 threshold = {RA769_THRESHOLD_DB_W_M2_HZ:.1f} dB(W/m²/Hz)"
+plot_epfd_cdf_paper(
+    linear_values,
+    threshold_db=RA769_THRESHOLD_DB_W_M2_HZ,
+    output_file=fr"C:\Users\gregh\Desktop\EPFD\cdf_convolved_{POL_MODE}_{ARRAY_GAIN_MODE}.pdf",
 )
 
-plt.xlabel("EPFD proxy referenced to 0 dBi [dB(W/m²/Hz)]")
-plt.ylabel("Percentage of nonzero samples (%)")
-plt.title("EPFD-like distribution in the 150.05–153 MHz band")
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# CDF
-plt.figure(figsize=(10, 6))
-plt.plot(sorted_vals, cdf, drawstyle="steps-post", linewidth=2, label="Empirical CDF")
-
-plt.axvline(
-    RA769_THRESHOLD_DB_W_M2_HZ,
-    linestyle="--",
-    linewidth=2,
-    label=f"RA.769 threshold = {RA769_THRESHOLD_DB_W_M2_HZ:.1f} dB(W/m²/Hz)"
+plot_primary_synthesis_combined_polar(
+    xyz_m=xyz_m,
+    grid_info=grid_info,
+    primary_gain_linear=primary_gain_linear,
+    point_az_deg=180.0,
+    point_el_deg=60.0,
+    freq_hz=FREQ_HZ,
+    n_ant=N_ANT,
+    array_gain_mode=ARRAY_GAIN_MODE,
+    floor_db=-40,
 )
-
-plt.xlabel("EPFD proxy referenced to 0 dBi [dB(W/m²/Hz)]")
-plt.ylabel("Cumulative probability")
-plt.title("EPFD-like CDF in the 150.05–153 MHz band")
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# ============================================================
-# CDF INCLUDING ZEROS, BUT DISPLAYED IN dB
-# ============================================================
-
-linear_values = epfd_window["pfd_w_m2_hz_0dBi_avg"].to_numpy()
-
-# Sort ALL values (including zeros)
-sorted_linear = np.sort(linear_values)
-
-# Build CDF (0 → 1)
-cdf = np.arange(1, len(sorted_linear) + 1) / len(sorted_linear)
-
-# Convert to dB for plotting
-# Avoid log(0) by masking zeros
-sorted_db = np.full_like(sorted_linear, np.nan, dtype=float)
-mask_nonzero = sorted_linear > 0
-sorted_db[mask_nonzero] = 10 * np.log10(sorted_linear[mask_nonzero])
-
-# Keep only finite values for plotting
-valid = np.isfinite(sorted_db)
-sorted_db_plot = sorted_db[valid]
-cdf_plot = cdf[valid]
-
-# Convert y-axis to %
-cdf_plot_percent = cdf_plot * 100
-
-# ============================================================
-# Plot
-# ============================================================
-
-plt.figure(figsize=(10, 6))
-
-plt.plot(sorted_db_plot, cdf_plot_percent, drawstyle="steps-post", linewidth=2, label="Empirical CDF (all samples)")
-
-plt.axvline(
-    RA769_THRESHOLD_DB_W_M2_HZ,
-    linestyle="--",
-    linewidth=2,
-    label=f"RA.769 threshold = {RA769_THRESHOLD_DB_W_M2_HZ:.1f} dB(W/m²/Hz)"
-)
-
-zero_fraction = 100 * np.mean(linear_values == 0)
-
-plt.text(
-    sorted_db_plot[0],
-    cdf_plot_percent[0] + 2,
-    f"{zero_fraction:.1f}% of samples = 0",
-    fontsize=10
-)
-
-plt.xlabel("EPFD proxy referenced to 0 dBi [dB(W/m²/Hz)]")
-plt.ylabel("Cumulative probability [%]")
-plt.title("EPFD CDF")
-plt.ylim(0, 100)
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-
-'''
-MAKE GIF
-'''
-'''
-import os
-import matplotlib.pyplot as plt
-import imageio
-frames_dir = "frames"
-os.makedirs(frames_dir, exist_ok=True)
-
-cell_az = np.array([cell["cell_lon"] for cell in grid_info])
-cell_el = np.array([cell["cell_lat"] for cell in grid_info])
-cell_r = np.radians(90 - cell_el)
-cell_theta = np.radians(cell_az)
-
-unique_windows = np.sort(epfd_window["window"].unique())
-
-filenames = []
-
-vmin = np.nanpercentile(epfd_window["epfd_db_w_m2_hz_0dBi"], 5)
-vmax = np.nanpercentile(epfd_window["epfd_db_w_m2_hz_0dBi"], 95)
-
-for w in unique_windows:
-    df_w = epfd_window[epfd_window["window"] == w]
-
-    # Nonzero cells only
-    mask = df_w["pfd_w_m2_hz_0dBi_avg"] > 0
-
-    # Values for coloring (in dB)
-    values_db = df_w.loc[mask, "epfd_db_w_m2_hz_0dBi"].to_numpy()
-
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(111, projection='polar')
-
-    ax.set_title(f"Window {w}", fontsize=12)
-    ax.set_yticklabels([])
-    ax.grid(True, alpha=0.3)
-
-    # Plot all cells as faint background
-    ax.scatter(cell_theta, cell_r, s=2, alpha=0.05)
-
-    # Plot active cells
-    if np.any(mask):
-        sc = ax.scatter(
-            cell_theta[df_w["cell_id"][mask]],
-            cell_r[df_w["cell_id"][mask]],
-            c=values_db,
-            s=10,
-            vmin=vmin,
-            vmax=vmax,
-        )
-
-        plt.colorbar(sc, ax=ax, label="EPFD [dB(W/m²/Hz)]")
-
-    fname = os.path.join(frames_dir, f"frame_{w:04d}.png")
-    plt.savefig(fname, dpi=120)
-    plt.close()
-
-    filenames.append(fname)
-
-gif_path = "epfd_sky_evolution.gif"
-
-with imageio.get_writer(gif_path, mode="I", duration=0.5) as writer:
-    for fname in filenames:
-        image = imageio.imread(fname)
-        writer.append_data(image)
-
-print(f"GIF saved to {gif_path}")
-'''
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
