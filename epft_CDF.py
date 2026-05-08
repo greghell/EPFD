@@ -9,13 +9,14 @@ from astropy.coordinates import EarthLocation, AltAz, get_sun
 from astropy.time import Time
 import astropy.units as u
 from mwa_pb import primary_beam
+from datetime import datetime, timezone
 
 C = 299792458.0
 
 CATALOG_CSV = r"C:\Users\gregh\Desktop\EPFD\identifications_test_v5_starlink_3_min_final_export.csv" # Grigg et al. detection dataset
 COORDS_CSV  = r"C:\Users\gregh\Desktop\EPFD\coords_xy.csv"  # EDA2 antennas coordinates
 
-POL_MODE = "YY"      # "XX" or "YY"
+POL_MODE = "XX"      # "XX" or "YY"
 FREQ_HZ = 150.0e6
 
 # ensures the detections all fall in the 150.05-153 MHz RAS protected band
@@ -25,6 +26,12 @@ FREQ_MAX_HZ = 154.00e6
 # all time samples
 TIME_MIN = 1719453402
 TIME_MAX = 1730019961
+
+OBS_PERIODS = [
+    ("150.78 MHz / 2024-07-14", "20240714 02131738", 24.2),
+    ("153.13 MHz / 2024-07-21", "20240721 01284544", 25.6),
+    ("150.78 MHz / 2024-09-10", "20240910 11060245", 24.2),
+]
 
 STACKED_CHANNEL = 31            # full 0.9 MHz channels
 MIN_ELEVATION_DEG = 20.0        # discard detections below 20 degrees in elevation
@@ -43,7 +50,7 @@ N_ANT = 256
 # "N2" -> kernel = N^2 * normalized_synthesis * primary_gain --> NOT APPLICABLE
 ARRAY_GAIN_MODE = "N"
 
-DAY_NIGHT_MODE = "any"         # "any", "day", "night"
+DAY_NIGHT_MODE = "night"         # "any", "day", "night"
 
 BEAM_DELAYS = np.zeros(16, dtype=int)
 BEAM_AMPS = np.zeros(16, dtype=int)
@@ -120,6 +127,72 @@ def assign_cells_from_grid(df, grid_info):
 
     out = df.copy()
     out["cell_id"] = cell_id
+    return out
+
+
+def parse_table_time(s):
+    date_str, time_str = s.split()
+    hh = int(time_str[0:2])
+    mm = int(time_str[2:4])
+    ss = int(time_str[4:6])
+    cs = int(time_str[6:8]) if len(time_str) >= 8 else 0
+
+    return datetime.strptime(date_str, "%Y%m%d").replace(
+        hour=hh,
+        minute=mm,
+        second=ss,
+        microsecond=cs * 10000,
+        tzinfo=timezone.utc,
+    ).timestamp()
+
+
+def build_observed_window_table(obs_periods, window_seconds, step_seconds):
+    rows = []
+
+    for label, start_str, duration_hours in obs_periods:
+        start = parse_table_time(start_str)
+        stop = start + duration_hours * 3600.0
+
+        start = int(np.floor(start / SNAPSHOT_SECONDS) * SNAPSHOT_SECONDS)
+        stop = int(np.floor(stop / SNAPSHOT_SECONDS) * SNAPSHOT_SECONDS)
+
+        starts = np.arange(
+            start,
+            stop - window_seconds + SNAPSHOT_SECONDS,
+            step_seconds,
+            dtype=int,
+        )
+
+        for i, t0 in enumerate(starts):
+            rows.append({
+                "dataset": label,
+                "window_start": int(t0),
+                "window_stop": int(t0 + window_seconds),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def add_window_day_night(windows):
+    mwa_location = EarthLocation(
+        lat=-26.7033 * u.deg,
+        lon=116.6708 * u.deg,
+        height=377 * u.m,
+    )
+
+    mid_time = 0.5 * (
+        windows["window_start"].to_numpy()
+        + windows["window_stop"].to_numpy()
+    )
+
+    times = Time(mid_time, format="unix")
+    sun_altaz = get_sun(times).transform_to(
+        AltAz(obstime=times, location=mwa_location)
+    )
+
+    out = windows.copy()
+    out["sun_el_deg_mid"] = sun_altaz.alt.deg
+    out["is_day"] = out["sun_el_deg_mid"] > 0
     return out
 
 
@@ -797,11 +870,7 @@ if TIME_MAX is not None:
 
 df = add_mwa_sun_elevation(df, time_col="time")
 
-if DAY_NIGHT_MODE == "day":
-    df = df[df["is_day"]].copy()
-elif DAY_NIGHT_MODE == "night":
-    df = df[~df["is_day"]].copy()
-elif DAY_NIGHT_MODE != "any":
+if DAY_NIGHT_MODE not in ["any", "day", "night"]:
     raise ValueError("DAY_NIGHT_MODE must be 'any', 'day', or 'night'")
 
 if POL_MODE == "XX":
@@ -890,38 +959,44 @@ print(f"Window length: {WINDOW_SAMPLES} samples = {window_duration_sec} s")
 print(f"Overlap: {OVERLAP_PERCENT:.1f}%")
 print(f"Window step: {step_samples} samples = {step_seconds} s")
 
-t_min = int(np.floor(df["time_bin"].min() / SNAPSHOT_SECONDS) * SNAPSHOT_SECONDS)
-t_max = int(np.ceil(df["time_bin"].max() / SNAPSHOT_SECONDS) * SNAPSHOT_SECONDS)
-
-window_starts = np.arange(
-    t_min,
-    t_max - window_duration_sec + SNAPSHOT_SECONDS,
-    step_seconds,
-    dtype=int,
+windows = build_observed_window_table(
+    OBS_PERIODS,
+    window_seconds=window_duration_sec,
+    step_seconds=step_seconds,
 )
 
-print("Number of candidate windows:", len(window_starts))
+windows = add_window_day_night(windows)
+
+if DAY_NIGHT_MODE == "day":
+    windows = windows[windows["is_day"]].copy()
+elif DAY_NIGHT_MODE == "night":
+    windows = windows[~windows["is_day"]].copy()
+
+windows = windows.reset_index(drop=True)
+
+print("Number of candidate observed-band windows:", len(windows))
 
 
 kernel_cache = {}
 convolved_windows = []
 
-for iw, t0 in enumerate(window_starts):
-    t1 = t0 + window_duration_sec
+for iw, row in windows.iterrows():
+    t0 = int(row["window_start"])
+    t1 = int(row["window_stop"])
 
     inst_w = inst[(inst["time_bin"] >= t0) & (inst["time_bin"] < t1)]
 
     if inst_w.empty:
-        continue
-
-    source_avg = (
-        inst_w.groupby("cell_id")["pfd_w_m2_hz"]
-              .sum()
-              .reindex(all_cells)
-              .fillna(0.0)
-              .to_numpy()
-              / WINDOW_SAMPLES
-    )
+        source_avg = np.zeros(n_cells, dtype=float)
+    else:
+        source_avg = (
+            inst_w.groupby("cell_id")["pfd_w_m2_hz"]
+                  .sum()
+                  .reindex(all_cells)
+                  .fillna(0.0)
+                  .to_numpy()
+                  / WINDOW_SAMPLES
+        )
 
     nonzero_source_cells = np.where(source_avg > 0)[0]
     convolved_map = np.zeros(n_cells, dtype=float)
