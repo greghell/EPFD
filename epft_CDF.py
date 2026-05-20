@@ -19,6 +19,8 @@ COORDS_CSV  = r"C:\Users\gregh\Desktop\EPFD\coords_xy.csv"  # EDA2 antennas coor
 POL_MODE = "XX"      # "XX" or "YY"
 FREQ_HZ = 150.0e6
 
+MIN_OUTPUT_CELL_ELEVATION_DEG = 0   # only include output EPFD cells above this elevation
+
 # ensures the detections all fall in the 150.05-153 MHz RAS protected band
 FREQ_MIN_HZ = 145.05e6
 FREQ_MAX_HZ = 154.00e6
@@ -50,7 +52,7 @@ N_ANT = 256
 # "N2" -> kernel = N^2 * normalized_synthesis * primary_gain --> NOT APPLICABLE
 ARRAY_GAIN_MODE = "N"
 
-DAY_NIGHT_MODE = "night"         # "any", "day", "night"
+DAY_NIGHT_MODE = "any"         # "any", "day", "night"
 
 BEAM_DELAYS = np.zeros(16, dtype=int)
 BEAM_AMPS = np.zeros(16, dtype=int)
@@ -910,7 +912,16 @@ _, _, grid_info = sky_cells_m1583(
 n_cells = len(grid_info)
 all_cells = np.arange(n_cells)
 
+cell_el = np.asarray(grid_info["cell_lat"], dtype=float).reshape(-1)
+
+output_cell_mask = cell_el >= MIN_OUTPUT_CELL_ELEVATION_DEG
+output_cells = all_cells[output_cell_mask]
+
 print("Number of sky cells:", n_cells)
+print(
+    f"Number of output sky cells with El >= {MIN_OUTPUT_CELL_ELEVATION_DEG:.1f} deg:",
+    len(output_cells),
+)
 
 df = assign_cells_from_grid(df, grid_info)
 df = df[df["cell_id"] >= 0].copy()
@@ -1019,8 +1030,8 @@ for iw, row in windows.iterrows():
         "window_index": iw,
         "window_start": t0,
         "window_stop": t1,
-        "cell_id": all_cells,
-        "pfd_w_m2_hz_conv": convolved_map,
+        "cell_id": output_cells,
+        "pfd_w_m2_hz_conv": convolved_map[output_cell_mask],
     })
 
     convolved_windows.append(out)
@@ -1052,8 +1063,12 @@ exceedance = np.mean(linear_values > threshold_linear)
 print(f"RA.769 threshold: {RA769_THRESHOLD_DB_W_M2_HZ:.1f} dB(W/m^2/Hz)")
 print(f"Fraction above threshold: {100 * exceedance:.6f}%")
 
+if MIN_OUTPUT_CELL_ELEVATION_DEG > 0:
+    fname = fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}_elev_{MIN_OUTPUT_CELL_ELEVATION_DEG}.npz"
+else:
+    fname = fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}.npz"
 
-np.savez(fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}.npz",
+np.savez(fname,
          linear_values=linear_values,
          RA769_THRESHOLD_DB_W_M2_HZ=RA769_THRESHOLD_DB_W_M2_HZ,
 )
