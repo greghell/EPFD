@@ -19,7 +19,7 @@ COORDS_CSV  = r"C:\Users\gregh\Desktop\EPFD\coords_xy.csv"  # EDA2 antennas coor
 POL_MODE = "XX"      # "XX" or "YY"
 FREQ_HZ = 150.0e6
 
-MIN_OUTPUT_CELL_ELEVATION_DEG = 0   # only include output EPFD cells above this elevation
+MIN_OUTPUT_CELL_ELEVATION_DEG = 40   # only include output EPFD cells above this elevation
 
 # ensures the detections all fall in the 150.05-153 MHz RAS protected band
 FREQ_MIN_HZ = 145.05e6
@@ -51,6 +51,13 @@ N_ANT = 256
 # "N"  -> kernel = N * normalized_synthesis * primary_gain
 # "N2" -> kernel = N^2 * normalized_synthesis * primary_gain --> NOT APPLICABLE
 ARRAY_GAIN_MODE = "N"
+RECEIVE_RESPONSE_MODE = "full_source_primary"
+# Options:
+# "full_source_primary"  -> N * synthesis_beam * primary_gain(source direction)
+# "full_output_primary"  -> diagnostic only: N * synthesis_beam * primary_gain(output direction)
+# "synth_only"           -> N * synthesis_beam
+# "primary_only"         -> no synthesis redistribution; source cell only
+# "none"                 -> no receive-response weighting
 
 DAY_NIGHT_MODE = "any"         # "any", "day", "night"
 
@@ -607,16 +614,30 @@ def compute_convolution_kernel_for_source_cell(
     freq_hz=150e6,
     n_ant=256,
     array_gain_mode="N",
+    receive_response_mode="full_source_primary",
 ):
     """
-    Imaging-array convolution kernel.
-    A source in source_cell_id is redistributed across the image by the
-    normalized synthesis beam. The resulting sky map is modulated by the
-    primary-beam gain in each output sky direction.
-        convolved_map(c) += P(source)
-                            * array_gain_factor
-                            * synthesis_beam(c | source)
-                            * primary_gain(c)
+    Receive-response weighting kernel for one source cell.
+
+    For an EPFD output/pointing cell n and source cell i,
+
+        EPFD_n += Phi_i * G_r(theta_i, omega_n)
+
+    with
+
+        G_r(theta_i, omega_n)
+            = N * G_synth(theta_i, omega_n) * G_primary(theta_i).
+
+    The primary beam is evaluated in the source direction. The synthesis
+    response is computed between the source cell and all output cells.
+    Because the array-factor power response is reciprocal for the present
+    unweighted array, this is implemented by phasing to the source cell and
+    evaluating the response over all output cells.
+
+    Modes:
+        "full_source_primary" -> N * synthesis_beam * primary_gain(source)
+        "full_output_primary" -> diagnostic only; old convention
+        "synth_only"          -> N * synthesis_beam
     """
 
     cell_az = np.asarray(grid_info["cell_lon"], dtype=float).reshape(-1)
@@ -636,7 +657,24 @@ def compute_convolution_kernel_for_source_cell(
 
     gain_factor = get_array_gain_factor(n_ant, array_gain_mode)
 
-    kernel = gain_factor * synth * primary_gain_linear
+    if receive_response_mode == "full_source_primary":
+        # Preferred EPFD convention:
+        # primary gain evaluated toward the source/satellite direction.
+        kernel = gain_factor * synth * primary_gain_linear[source_cell_id]
+
+    elif receive_response_mode == "full_output_primary":
+        # Diagnostic only: old convention.
+        # Primary gain evaluated over output cells.
+        kernel = gain_factor * synth * primary_gain_linear
+
+    elif receive_response_mode == "synth_only":
+        kernel = gain_factor * synth
+
+    else:
+        raise ValueError(
+            "receive_response_mode must be "
+            "'full_source_primary', 'full_output_primary', or 'synth_only'"
+        )
 
     return kernel
 
@@ -769,14 +807,15 @@ def plot_primary_synthesis_combined_polar(
 
     gain_factor = get_array_gain_factor(n_ant, array_gain_mode)
 
-    # Imaging-map convention:
-    # combined = synthesis response × primary gain at output direction.
+    # Receive-pattern convention for one fixed output/pointing direction:
+    # combined(source direction) =
+    #     array gain × synthesis response toward source × primary gain toward source.
     combined = gain_factor * synth * primary_gain_linear
-
+    
     panels = [
-        ("Primary gain", primary_gain_linear),
-        ("Normalized synthesis beam", synth),
-        (f"{array_gain_mode}: array gain × synthesis × output primary", combined),
+        ("Primary gain toward source direction", primary_gain_linear),
+        ("Normalized synthesis response for fixed pointing", synth),
+        (f"{array_gain_mode}: array gain × synthesis × source primary", combined),
     ]
 
     theta = np.radians(cell_az)
@@ -1009,22 +1048,44 @@ for iw, row in windows.iterrows():
                   / WINDOW_SAMPLES
         )
 
-    nonzero_source_cells = np.where(source_avg > 0)[0]
-    convolved_map = np.zeros(n_cells, dtype=float)
-
-    for src_cell in nonzero_source_cells:
-        if src_cell not in kernel_cache:
-            kernel_cache[src_cell] = compute_convolution_kernel_for_source_cell(
-                source_cell_id=src_cell,
-                xyz_m=xyz_m,
-                grid_info=grid_info,
-                primary_gain_linear=primary_gain_linear,
-                freq_hz=FREQ_HZ,
-                n_ant=N_ANT,
-                array_gain_mode=ARRAY_GAIN_MODE,
-            )
-
-        convolved_map += source_avg[src_cell] * kernel_cache[src_cell]
+    if RECEIVE_RESPONSE_MODE in ["full_source_primary", "full_output_primary", "synth_only"]:
+        nonzero_source_cells = np.where(source_avg > 0)[0]
+        convolved_map = np.zeros(n_cells, dtype=float)
+    
+        for src_cell in nonzero_source_cells:
+            cache_key = (src_cell, RECEIVE_RESPONSE_MODE)
+    
+            if cache_key not in kernel_cache:
+                kernel_cache[cache_key] = compute_convolution_kernel_for_source_cell(
+                    source_cell_id=src_cell,
+                    xyz_m=xyz_m,
+                    grid_info=grid_info,
+                    primary_gain_linear=primary_gain_linear,
+                    freq_hz=FREQ_HZ,
+                    n_ant=N_ANT,
+                    array_gain_mode=ARRAY_GAIN_MODE,
+                    receive_response_mode=RECEIVE_RESPONSE_MODE,
+                )
+    
+            convolved_map += source_avg[src_cell] * kernel_cache[cache_key]
+    
+    elif RECEIVE_RESPONSE_MODE == "primary_only":
+        # Diagnostic: no synthesis-beam redistribution.
+        # Keep measured source flux in its source cell only, but apply the
+        # primary-beam gain for that cell.
+        convolved_map = source_avg * primary_gain_linear
+    
+    elif RECEIVE_RESPONSE_MODE == "none":
+        # Diagnostic only: no receive-response weighting or redistribution.
+        # This keeps measured source flux only in the detected source cell.
+        convolved_map = source_avg.copy()
+    
+    else:
+        raise ValueError(
+            "RECEIVE_RESPONSE_MODE must be "
+            "'full_source_primary', 'full_output_primary', "
+            "'synth_only', 'primary_only', or 'none'"
+        )
 
     out = pd.DataFrame({
         "window_index": iw,
@@ -1063,10 +1124,12 @@ exceedance = np.mean(linear_values > threshold_linear)
 print(f"RA.769 threshold: {RA769_THRESHOLD_DB_W_M2_HZ:.1f} dB(W/m^2/Hz)")
 print(f"Fraction above threshold: {100 * exceedance:.6f}%")
 
+
+mode_tag = RECEIVE_RESPONSE_MODE
 if MIN_OUTPUT_CELL_ELEVATION_DEG > 0:
-    fname = fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}_elev_{MIN_OUTPUT_CELL_ELEVATION_DEG}.npz"
+    fname = fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}_{mode_tag}_elev_{MIN_OUTPUT_CELL_ELEVATION_DEG}.npz"
 else:
-    fname = fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}.npz"
+    fname = fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}_{mode_tag}.npz"
 
 np.savez(fname,
          linear_values=linear_values,
@@ -1076,7 +1139,7 @@ np.savez(fname,
 plot_epfd_cdf_paper(
     linear_values,
     threshold_db=RA769_THRESHOLD_DB_W_M2_HZ,
-    output_file=fr"C:\Users\gregh\Desktop\EPFD\cdf_convolved_{POL_MODE}_{ARRAY_GAIN_MODE}.pdf",
+    output_file=fr"C:\Users\gregh\Desktop\EPFD\cdf_{POL_MODE}_{DAY_NIGHT_MODE}_{RECEIVE_RESPONSE_MODE}_{ARRAY_GAIN_MODE}.pdf",
 )
 
 plot_primary_synthesis_combined_polar(
